@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  Linking,
+  PermissionsAndroid,
   Platform,
   Pressable,
   ScrollView,
@@ -9,6 +11,9 @@ import {
   View,
 } from 'react-native';
 import { Audio } from 'expo-av';
+import * as Contacts from 'expo-contacts';
+import * as IntentLauncher from 'expo-intent-launcher';
+import * as Speech from 'expo-speech';
 import { StatusBar } from 'expo-status-bar';
 
 // expo-file-system is native-only; web uses localStorage
@@ -20,8 +25,14 @@ const TRANSCRIPTS_DIR = () => FileSystem?.documentDirectory + 'transcripts/';
 const WEB_STORAGE_KEY = 'voice_transcripts';
 
 const OPENAI_API_KEY = process.env.EXPO_PUBLIC_OPENAI_API_KEY ?? '';
+const ANTHROPIC_API_KEY = process.env.EXPO_PUBLIC_ANTHROPIC_API_KEY ?? '';
 
-type RecordingState = 'idle' | 'recording' | 'transcribing';
+type RecordingState = 'idle' | 'recording' | 'transcribing' | 'analyzing' | 'calling';
+
+interface CallInfo {
+  name: string;
+  phone: string;
+}
 
 interface Transcript {
   id: string;
@@ -113,12 +124,69 @@ async function transcribeWithWhisper(audioUri: string): Promise<string> {
   return (await res.json()).text as string;
 }
 
+// ── Claude + Contacts ────────────────────────────────────────────────────────
+
+async function findContactFromTranscript(transcript: string): Promise<CallInfo | null> {
+  if (!ANTHROPIC_API_KEY || ANTHROPIC_API_KEY === 'your_anthropic_api_key_here') return null;
+
+  // Request contacts permission
+  const { status } = await Contacts.requestPermissionsAsync();
+  if (status !== 'granted') throw new Error('Contacts permission denied.');
+
+  // Step 1: Ask Claude for just the name mentioned in the transcript
+  const nameRes = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify({
+      model: 'claude-opus-4-6',
+      max_tokens: 64,
+      messages: [
+        {
+          role: 'user',
+          content: `From this voice transcript, extract the name of the person who needs to be called. Return ONLY the name, or null if no one needs to be called.\n\nTranscript: ${transcript}`,
+        },
+      ],
+    }),
+  });
+
+  if (!nameRes.ok) throw new Error(`Claude API error: ${nameRes.status} ${await nameRes.text()}`);
+
+  const nameJson = await nameRes.json();
+  const extractedName = (nameJson.content?.[0]?.text ?? 'null').trim();
+  if (extractedName === 'null' || !extractedName) return null;
+
+  // Step 2: Search phone contacts by name
+  const { data } = await Contacts.getContactsAsync({
+    name: extractedName,
+    fields: [Contacts.Fields.Name, Contacts.Fields.PhoneNumbers],
+  });
+
+  if (!data.length) return null;
+
+  // Pick first contact with a phone number
+  for (const contact of data) {
+    const phone = contact.phoneNumbers?.[0]?.number;
+    if (phone) {
+      // Strip formatting only, preserve the number exactly as stored in contacts
+      const cleaned = phone.replace(/[^\d+]/g, '');
+      return { name: contact.name ?? extractedName, phone: cleaned };
+    }
+  }
+
+  return null;
+}
+
 // ── App ──────────────────────────────────────────────────────────────────────
 
 export default function App() {
   const [recordingState, setRecordingState] = useState<RecordingState>('idle');
   const [transcripts, setTranscripts] = useState<Transcript[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [callingName, setCallingName] = useState<string | null>(null);
   const recordingRef = useRef<Audio.Recording | null>(null);
 
   useEffect(() => {
@@ -152,15 +220,50 @@ export default function App() {
       const text = await transcribeWithWhisper(uri);
       await storageSave(text);
       setTranscripts(await storageLoad());
+      setRecordingState('analyzing');
+      const contact = await findContactFromTranscript(text);
+      if (contact) {
+        setCallingName(contact.name);
+        setRecordingState('calling');
+        // Small delay so UI renders the "Calling..." banner before dialer opens
+        await new Promise((r) => setTimeout(r, 300));
+        await new Promise<void>((resolve) => {
+          Speech.speak(`Calling ${contact.name}`, { onDone: resolve, onStopped: resolve });
+        });
+        const dialUrl = `tel:${contact.phone}`;
+        console.log('Dialing:', dialUrl);
+        if (Platform.OS === 'android') {
+          const granted = await PermissionsAndroid.request(
+            PermissionsAndroid.PERMISSIONS.CALL_PHONE
+          );
+          if (granted !== PermissionsAndroid.RESULTS.GRANTED) {
+            throw new Error('Phone call permission denied.');
+          }
+          // Reset state before launching — intent never returns a result
+          setCallingName(null);
+          setRecordingState('idle');
+          IntentLauncher.startActivityAsync('android.intent.action.CALL', { data: dialUrl });
+        } else {
+          setCallingName(null);
+          setRecordingState('idle');
+          await Linking.openURL(dialUrl);
+        }
+      } else {
+        setError('Could not find a matching contact. Please try again.');
+        setRecordingState('idle');
+      }
     } catch (e: any) {
       setError(e.message);
-    } finally {
+      setCallingName(null);
       setRecordingState('idle');
     }
   }
 
   const isRecording = recordingState === 'recording';
   const isTranscribing = recordingState === 'transcribing';
+  const isAnalyzing = recordingState === 'analyzing';
+  const isCalling = recordingState === 'calling';
+  const isBusy = isTranscribing || isAnalyzing || isCalling;
 
   return (
     <View style={styles.container}>
@@ -171,22 +274,29 @@ export default function App() {
         style={[
           styles.button,
           isRecording && styles.buttonRecording,
-          isTranscribing && styles.buttonDisabled,
+          isBusy && styles.buttonDisabled,
         ]}
-        onPress={isRecording ? stopAndTranscribe : startRecording}
-        disabled={isTranscribing}
+        onPressIn={isBusy ? undefined : startRecording}
+        onPressOut={isRecording ? stopAndTranscribe : undefined}
+        disabled={isBusy}
       >
-        {isTranscribing ? (
+        {isBusy ? (
           <ActivityIndicator color="#fff" />
         ) : (
           <Text style={styles.buttonText}>
-            {isRecording ? 'Stop & Transcribe' : 'Start Recording'}
+            {isRecording ? 'Release to Send' : 'Hold to Talk'}
           </Text>
         )}
       </Pressable>
 
-      {isRecording && <Text style={styles.statusLabel}>Recording...</Text>}
-      {isTranscribing && <Text style={styles.statusLabel}>Transcribing...</Text>}
+      {isRecording && <Text style={styles.statusLabel}>🎙 Recording...</Text>}
+      {isTranscribing && <Text style={styles.statusLabel}>⏳ Transcribing...</Text>}
+      {isAnalyzing && <Text style={styles.statusLabel}>🔍 Finding contact...</Text>}
+      {isCalling && (
+        <View style={styles.callingBanner}>
+          <Text style={styles.callingLabel}>📞 Calling {callingName}...</Text>
+        </View>
+      )}
       {error && <Text style={styles.error}>{error}</Text>}
 
       {Platform.OS === 'web' && (
@@ -224,6 +334,15 @@ const styles = StyleSheet.create({
   buttonDisabled: { backgroundColor: '#9ca3af' },
   buttonText: { color: '#fff', fontSize: 16, fontWeight: '600' },
   statusLabel: { textAlign: 'center', color: '#6b7280', marginBottom: 8 },
+  callingBanner: {
+    backgroundColor: '#dbeafe',
+    borderRadius: 12,
+    paddingVertical: 16,
+    paddingHorizontal: 20,
+    marginBottom: 12,
+    alignItems: 'center',
+  },
+  callingLabel: { textAlign: 'center', color: '#1d4ed8', fontSize: 22, fontWeight: '800' },
   error: { color: '#dc2626', textAlign: 'center', marginBottom: 8 },
   webNote: { textAlign: 'center', color: '#9ca3af', fontSize: 12, marginBottom: 8 },
   list: { flex: 1, marginTop: 16 },
